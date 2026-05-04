@@ -1,0 +1,489 @@
+#!/usr/bin/env bash
+# =============================================================================
+# ALT BUILD.FUNC — адаптация misc/build.func для Альт Виртуализация PVE
+# =============================================================================
+# Оригинал: community-scripts/ProxmoxVED (MIT)
+# Авторы оригинала: tteck (tteckster) | MickLesk | michelroegl-brunner
+# Адаптация: kosar33 / AltPveVE
+#
+# ПРИНЦИП АДАПТАЦИИ:
+#   Не подделываем значения — переписываем функции под реальность Альта:
+#   - Хост: Альт Линукс (RPM-based), пакетный менеджер apt-rpm / apt-get
+#   - Пакеты LXC/PVE собраны из исходников под Альт, называются иначе
+#   - dpkg/dpkg-query/apt-cache — отсутствуют, используем rpm/rpm-query
+#   - Проверки репозиториев — под APT Альта (/etc/apt/sources.list.d/)
+#   - Всё остальное (pct, pvesm, pvesh, lxc-attach) — работает штатно,
+#     т.к. Базальт портировал оригинальные утилиты Proxmox
+# =============================================================================
+
+# Загружаем вспомогательные функции из нашего форка (core/error/api)
+ALT_SCRIPTS_URL="${ALT_SCRIPTS_URL:-https://raw.githubusercontent.com/kosar33/AltPveVE/main}"
+
+# Переменная для build_container(), чтобы он брал install-скрипты из нашего репо
+COMMUNITY_SCRIPTS_URL="${ALT_SCRIPTS_URL}"
+
+# Подгружаем оригинальные core.func/error_handler.func/api.func — они
+# платформонезависимы (работают с bash, не вызывают dpkg/apt-cache напрямую)
+_ORIG_URL="https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main"
+
+if command -v curl >/dev/null 2>&1; then
+  source <(curl -fsSL "$_ORIG_URL/misc/api.func")
+  source <(curl -fsSL "$_ORIG_URL/misc/core.func")
+  source <(curl -fsSL "$_ORIG_URL/misc/error_handler.func")
+  load_functions
+  catch_errors
+fi
+
+# =============================================================================
+# SECTION 1: ИНИЦИАЛИЗАЦИЯ ПЕРЕМЕННЫХ
+# Полностью совпадает с оригиналом — Альт предоставляет те же утилиты
+# (hostname, uname, pveversion, pvesh)
+# =============================================================================
+variables() {
+  NSAPP=$(echo "${APP,,}" | tr -d ' ')
+  var_install="${NSAPP}-install"
+  INTEGER='^[0-9]+([.][0-9]+)?$'
+  PVEHOST_NAME=$(hostname)
+  DIAGNOSTICS="yes"
+  METHOD="default"
+  RANDOM_UUID="$(cat /proc/sys/kernel/random/uuid)"
+  SESSION_ID="${RANDOM_UUID:0:8}"
+  BUILD_LOG="/tmp/create-lxc-${SESSION_ID}.log"
+  combined_log="/tmp/install-${SESSION_ID}-combined.log"
+  CTTYPE="${CTTYPE:-${CT_TYPE:-1}}"
+
+  parse_dev_mode
+
+  if [[ "${DEV_MODE_LOGS:-false}" == "true" ]]; then
+    mkdir -p /var/log/community-scripts
+    BUILD_LOG="/var/log/community-scripts/create-lxc-${SESSION_ID}-$(date +%Y%m%d_%H%M%S).log"
+    combined_log="/var/log/community-scripts/install-${SESSION_ID}-combined-$(date +%Y%m%d_%H%M%S).log"
+  fi
+
+  # pveversion есть и в Альте (порт от Базальт СПО)
+  if command -v pveversion >/dev/null 2>&1; then
+    PVEVERSION="$(pveversion | awk -F'/' '{print $2}' | awk -F'-' '{print $1}')"
+  else
+    PVEVERSION="N/A"
+  fi
+  KERNEL_VERSION=$(uname -r)
+
+  [[ -n "${var_cpu:-}" && "${var_cpu}" =~ ^[0-9]+$ ]] && export APP_DEFAULT_CPU="${var_cpu}"
+  [[ -n "${var_ram:-}" && "${var_ram}" =~ ^[0-9]+$ ]] && export APP_DEFAULT_RAM="${var_ram}"
+  [[ -n "${var_disk:-}" && "${var_disk}" =~ ^[0-9]+$ ]] && export APP_DEFAULT_DISK="${var_disk}"
+}
+
+# =============================================================================
+# SECTION 2: PREFLIGHT-ПРОВЕРКИ
+# Полностью переписаны для Альта — без dpkg/apt-cache
+# =============================================================================
+
+PREFLIGHT_PASSED=0
+PREFLIGHT_FAILED=0
+PREFLIGHT_WARNINGS=0
+PREFLIGHT_FAILURES=()
+PREFLIGHT_EXIT_CODE=0
+
+preflight_pass() {
+  ((PREFLIGHT_PASSED++)) || true
+  echo -e "  ${CM} ${GN}${1}${CL}"
+}
+
+preflight_fail() {
+  local msg="$1" exit_code="${2:-1}"
+  ((PREFLIGHT_FAILED++)) || true
+  PREFLIGHT_FAILURES+=("${exit_code}|${msg}")
+  [[ "$PREFLIGHT_EXIT_CODE" -eq 0 ]] && PREFLIGHT_EXIT_CODE="$exit_code"
+  echo -e "  ${CROSS} ${RD}${msg}${CL}"
+}
+
+preflight_warn() {
+  ((PREFLIGHT_WARNINGS++)) || true
+  echo -e "  ${INFO} ${YW}${1}${CL}"
+}
+
+# --- Ядро: лимиты ключей (идентично оригиналу, /proc одинаков) ---
+preflight_maxkeys() {
+  local maxkeys maxbytes used_keys used_bytes
+  maxkeys=$(cat /proc/sys/kernel/keys/maxkeys 2>/dev/null || echo 0)
+  maxbytes=$(cat /proc/sys/kernel/keys/maxbytes 2>/dev/null || echo 0)
+
+  if [[ "$maxkeys" -eq 0 || "$maxbytes" -eq 0 ]]; then
+    preflight_fail "Не удалось прочитать параметры ядра (kernel keys)" 107
+    return 0
+  fi
+
+  used_keys=$(awk '/100000:/ {print $2}' /proc/key-users 2>/dev/null || echo 0)
+  used_bytes=$(awk '/100000:/ {split($5, a, "/"); print a[1]}' /proc/key-users 2>/dev/null || echo 0)
+
+  if [[ "$used_keys" -gt $((maxkeys - 100)) || "$used_bytes" -gt $((maxbytes - 1000)) ]]; then
+    preflight_fail "Лимиты ключей ядра близки к исчерпанию (keys: ${used_keys}/${maxkeys})" 108
+    echo -e "    ${TAB}${INFO} Добавьте в /etc/sysctl.d/98-altpve.conf:"
+    echo -e "    ${TAB}${INFO} kernel.keys.maxkeys=$((maxkeys * 2))"
+    echo -e "    ${TAB}${INFO} kernel.keys.maxbytes=$((maxbytes * 2))"
+    return 0
+  fi
+  preflight_pass "Лимиты ключей ядра в норме (${used_keys}/${maxkeys})"
+}
+
+# --- Хранилище: rootdir ---
+preflight_storage_rootdir() {
+  local count
+  count=$(pvesm status -content rootdir 2>/dev/null | awk 'NR>1 {count++} END {print count+0}')
+  if [[ "$count" -eq 0 ]]; then
+    preflight_fail "Нет хранилища с поддержкой 'rootdir'" 119
+    echo -e "    ${TAB}${INFO} Включите тип контента 'rootdir' в Datacenter → Storage"
+    return 0
+  fi
+  preflight_pass "Хранилище 'rootdir' доступно (${count} шт.)"
+}
+
+# --- Хранилище: шаблоны контейнеров ---
+preflight_storage_vztmpl() {
+  local count
+  count=$(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {count++} END {print count+0}')
+  if [[ "$count" -eq 0 ]]; then
+    preflight_fail "Нет хранилища с поддержкой 'vztmpl' (шаблоны LXC)" 120
+    echo -e "    ${TAB}${INFO} Включите тип контента 'vztmpl' в Datacenter → Storage"
+    return 0
+  fi
+  preflight_pass "Хранилище 'vztmpl' доступно (${count} шт.)"
+}
+
+# --- Хранилище: свободное место ---
+preflight_storage_space() {
+  local required_gb="${var_disk:-4}"
+  local required_kb=$((required_gb * 1024 * 1024))
+  local has_enough=0 best_storage="" best_free=0
+
+  while read -r storage_name _ _ _ _ free_kb _; do
+    [[ -z "$storage_name" || -z "$free_kb" || "$free_kb" == "0" ]] && continue
+    if [[ "$free_kb" -ge "$required_kb" ]]; then
+      has_enough=1
+      if [[ "$free_kb" -gt "$best_free" ]]; then
+        best_free="$free_kb"; best_storage="$storage_name"
+      fi
+    fi
+  done < <(pvesm status -content rootdir 2>/dev/null | awk 'NR>1')
+
+  if [[ "$has_enough" -eq 0 ]]; then
+    preflight_fail "Недостаточно места на хранилищах (нужно ${required_gb} ГБ для ${APP})" 214
+    return 0
+  fi
+  preflight_pass "Свободного места достаточно (${best_storage}: нужно ${required_gb} ГБ)"
+}
+
+# --- Сеть: мост vmbr0 ---
+preflight_network_bridge() {
+  local bridges
+  bridges=$(ip -o link show type bridge 2>/dev/null | grep -oE 'vmbr[0-9]+' | sort -u)
+
+  if [[ -z "$bridges" ]]; then
+    preflight_fail "Не найдено сетевых мостов (vmbr*)" 116
+    echo -e "    ${TAB}${INFO} Создайте мост в Network → Create → Linux Bridge"
+    return 0
+  fi
+
+  if echo "$bridges" | grep -qx "vmbr0"; then
+    preflight_pass "Сетевой мост vmbr0 доступен"
+  else
+    local first_bridge; first_bridge=$(echo "$bridges" | head -1)
+    preflight_warn "Мост vmbr0 не найден, доступен ${first_bridge}"
+    echo -e "    ${TAB}${INFO} Используйте Advanced Settings для выбора ${first_bridge}"
+  fi
+}
+
+# --- DNS ---
+preflight_dns_resolution() {
+  local resolved=0
+  for host in "raw.githubusercontent.com" "download.proxmox.com"; do
+    if getent hosts "$host" &>/dev/null || host "$host" &>/dev/null 2>&1; then
+      resolved=1; break
+    fi
+  done
+  if [[ "$resolved" -eq 0 ]]; then
+    preflight_fail "DNS не работает — невозможно скачать шаблоны" 222
+    echo -e "    ${TAB}${INFO} Проверьте /etc/resolv.conf"
+    return 0
+  fi
+  preflight_pass "DNS работает"
+}
+
+# --- Репозитории Альта (вместо проверки enterprise Proxmox) ---
+# В Альте нет enterprise.proxmox.com; проверяем доступность репозиториев Базальта
+preflight_repo_access() {
+  # Проверяем доступность репозитория Альта (ftp.altlinux.org или аналог)
+  local alt_repo_url=""
+  # Ищем настроенный репозиторий в sources
+  if [[ -f /etc/apt/sources.list ]]; then
+    alt_repo_url=$(grep -v '^#' /etc/apt/sources.list 2>/dev/null | awk '/^rpm / {print $2; exit}')
+  fi
+  if [[ -z "$alt_repo_url" ]]; then
+    alt_repo_url=$(find /etc/apt/sources.list.d/ -name '*.list' 2>/dev/null -exec grep -h '^rpm ' {} \; | awk '{print $2; exit}')
+  fi
+
+  if [[ -z "$alt_repo_url" ]]; then
+    preflight_warn "Не удалось определить URL репозитория Альта"
+    return 0
+  fi
+
+  local http_code
+  http_code=$(curl -sS -o /dev/null -w "%{http_code}" -m 5 "$alt_repo_url" 2>/dev/null) || http_code="000"
+
+  if [[ "$http_code" =~ ^2|^3 ]]; then
+    preflight_pass "Репозиторий Альта доступен ($alt_repo_url)"
+  else
+    preflight_warn "Репозиторий Альта недоступен (HTTP ${http_code}) — обновления пакетов хоста могут не работать"
+  fi
+}
+
+# --- Кластер ---
+preflight_cluster_quorum() {
+  if [[ ! -f /etc/pve/corosync.conf ]]; then
+    preflight_pass "Одиночный узел (кластер не используется)"
+    return 0
+  fi
+  if pvecm status 2>/dev/null | awk -F':' '/^Quorate/ { exit ($2 ~ /Yes/) ? 0 : 1 }'; then
+    preflight_pass "Кластер в кворуме"
+  else
+    preflight_fail "Кластер не в кворуме — создание контейнеров может провалиться" 210
+    echo -e "    ${TAB}${INFO} Убедитесь, что все ноды кластера работают"
+  fi
+}
+
+# --- LXC-стек Альта ---
+# Оригинал проверяет deb-пакеты pve-container и lxc-pve через dpkg-query.
+# В Альте эти пакеты называются иначе и упакованы в RPM.
+# Проверяем наличие реальных бинарников и rpm-пакетов.
+preflight_lxc_stack() {
+  local missing=()
+
+  # Бинарники, которые должны присутствовать в любом случае
+  for bin in pct lxc-start lxc-attach lxc-info; do
+    if ! command -v "$bin" >/dev/null 2>&1; then
+      missing+=("$bin")
+    fi
+  done
+
+  if [[ ${#missing[@]} -gt 0 ]]; then
+    preflight_fail "Отсутствуют утилиты LXC: ${missing[*]}" 231
+    echo -e "    ${TAB}${INFO} Установите пакет pve-container:"
+    echo -e "    ${TAB}${INFO} apt-get install pve-container"
+    return 0
+  fi
+
+  # Проверяем версию через rpm (Альт использует RPM)
+  local pct_pkg_ver=""
+  if command -v rpm >/dev/null 2>&1; then
+    # Имя пакета может быть pve-container или pve-manager — проверяем оба
+    pct_pkg_ver=$(rpm -q --qf '%{VERSION}\n' pve-container 2>/dev/null \
+                  || rpm -q --qf '%{VERSION}\n' pve-manager 2>/dev/null \
+                  || echo "")
+  fi
+
+  if [[ -n "$pct_pkg_ver" ]]; then
+    preflight_pass "LXC-стек установлен (pve-container/pve-manager: ${pct_pkg_ver})"
+  else
+    # rpm-пакет не нашли, но бинарники есть — предупреждаем, не падаем
+    preflight_warn "Версия LXC-пакета не определена (rpm-база не ответила), но утилиты pct/lxc присутствуют"
+  fi
+}
+
+# --- ID контейнера ---
+preflight_container_id() {
+  local nextid
+  nextid=$(pvesh get /cluster/nextid 2>/dev/null) || true
+  if [[ -z "$nextid" || ! "$nextid" =~ ^[0-9]+$ ]]; then
+    preflight_fail "Невозможно получить следующий ID контейнера (pvesh /cluster/nextid)" 109
+    return 0
+  fi
+  preflight_pass "ID контейнеров доступны (следующий: ${nextid})"
+}
+
+# --- Доступность сервера шаблонов ---
+# Оригинал проверяет download.proxmox.com.
+# В Альте шаблоны берутся с images.linuxcontainers.org или из локального хранилища.
+preflight_template_connectivity() {
+  local ok=0
+
+  # Проверяем оба источника
+  for url in \
+    "https://images.linuxcontainers.org/" \
+    "http://download.proxmox.com/images/system/"; do
+    local code
+    code=$(curl -sS -o /dev/null -w "%{http_code}" -m 5 "$url" 2>/dev/null) || code="000"
+    if [[ "$code" =~ ^2|^3 ]]; then
+      ok=1; break
+    fi
+  done
+
+  if [[ "$ok" -eq 1 ]]; then
+    preflight_pass "Сервер шаблонов доступен"
+    return 0
+  fi
+
+  # Есть ли локальные шаблоны?
+  local local_count=0
+  while read -r storage_name _; do
+    [[ -z "$storage_name" ]] && continue
+    local cnt; cnt=$(pveam list "$storage_name" 2>/dev/null | awk 'NR>1' | wc -l)
+    local_count=$((local_count + cnt))
+  done < <(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}')
+
+  if [[ "$local_count" -gt 0 ]]; then
+    preflight_warn "Сервер шаблонов недоступен, но найдено ${local_count} локальных шаблонов"
+    return 0
+  fi
+
+  preflight_fail "Сервер шаблонов недоступен и локальных шаблонов нет" 222
+  echo -e "    ${TAB}${INFO} Загрузите шаблон вручную через pveam или веб-интерфейс"
+}
+
+# --- Наличие шаблона для нужной ОС ---
+preflight_template_available() {
+  local os="${var_os:-}" version="${var_version:-}"
+  [[ -z "$os" || -z "$version" ]] && {
+    preflight_pass "Проверка шаблона пропущена (OS/версия не заданы)"
+    return 0
+  }
+
+  local search_pattern="${os}-${version}"
+  local local_match=0
+
+  while read -r storage_name _; do
+    [[ -z "$storage_name" ]] && continue
+    if pveam list "$storage_name" 2>/dev/null | awk '{print $1}' \
+       | grep -qE "/${search_pattern}[.-]"; then
+      local_match=1; break
+    fi
+  done < <(pvesm status -content vztmpl 2>/dev/null | awk 'NR>1 {print $1}')
+
+  if [[ "$local_match" -eq 1 ]]; then
+    preflight_pass "Шаблон ${os} ${version} найден локально"
+    return 0
+  fi
+
+  # Проверяем онлайн-каталог
+  if pveam available -section system 2>/dev/null | awk '{print $2}' \
+     | grep -qE "^${search_pattern}[.-]"; then
+    preflight_pass "Шаблон ${os} ${version} доступен онлайн"
+    return 0
+  fi
+
+  local available
+  available=$(pveam available -section system 2>/dev/null \
+    | awk '{print $2}' | grep -oE "^${os}-[0-9]+(\.[0-9]+)?" \
+    | sed "s/^${os}-//" | sort -uV | tr '\n' ',' | sed 's/,$//' | sed 's/,/, /g')
+
+  preflight_fail "Шаблон не найден: ${os} ${version}" 225
+  [[ -n "$available" ]] && echo -e "    ${TAB}${INFO} Доступные версии ${os}: ${GN}${available}${CL}"
+}
+
+# --- Запуск всех проверок ---
+run_preflight() {
+  PREFLIGHT_PASSED=0; PREFLIGHT_FAILED=0; PREFLIGHT_WARNINGS=0
+  PREFLIGHT_FAILURES=(); PREFLIGHT_EXIT_CODE=0
+
+  echo -e "${INFO}${BOLD}${DGN} Запуск предварительных проверок (Альт Виртуализация PVE)...${CL}"
+  echo ""
+
+  preflight_maxkeys
+  preflight_storage_rootdir
+  preflight_storage_vztmpl
+  preflight_storage_space
+  preflight_network_bridge
+  preflight_dns_resolution
+  preflight_repo_access
+  preflight_cluster_quorum
+  preflight_lxc_stack          # ← RPM-версия вместо dpkg
+  preflight_container_id
+  preflight_template_connectivity
+  preflight_template_available
+
+  echo ""
+
+  if [[ "$PREFLIGHT_FAILED" -gt 0 ]]; then
+    echo -e "${CROSS}${BOLD}${RD} Проверки не пройдены: ${PREFLIGHT_FAILED} ошибок, ${PREFLIGHT_WARNINGS} предупреждений${CL}"
+    echo ""
+    for failure in "${PREFLIGHT_FAILURES[@]}"; do
+      local code="${failure%%|*}" msg="${failure#*|}"
+      echo -e "  ${CROSS} [Код ${code}] ${msg}"
+    done
+    echo ""
+    echo -e "${INFO} Устраните ошибки перед созданием контейнера."
+    post_preflight_to_api 2>/dev/null || true
+    exit "$PREFLIGHT_EXIT_CODE"
+  fi
+
+  if [[ "$PREFLIGHT_WARNINGS" -gt 0 ]]; then
+    echo -e "${CM}${BOLD}${GN} Проверки пройдены с ${PREFLIGHT_WARNINGS} предупреждениями (${PREFLIGHT_PASSED} ОК)${CL}"
+  else
+    echo -e "${CM}${BOLD}${GN} Все проверки пройдены (${PREFLIGHT_PASSED}/${PREFLIGHT_PASSED})${CL}"
+  fi
+  sleep 2
+}
+
+# =============================================================================
+# SECTION 3: ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ
+# Большинство не зависят от Debian/RPM — берём из оригинала напрямую.
+# Ниже только те, что требовали адаптации.
+# =============================================================================
+
+# IP-адрес контейнера — добавляем поддержку Альт-контейнеров (если var_os=altlinux)
+get_current_ip() {
+  CURRENT_IP=""
+  if [[ -f /etc/os-release ]]; then
+    if grep -qE 'ID=debian|ID=ubuntu' /etc/os-release; then
+      CURRENT_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+    elif grep -qE 'ID=altlinux|ID="altlinux"' /etc/os-release; then
+      CURRENT_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$' | head -n1)
+    elif grep -q 'ID=alpine' /etc/os-release; then
+      CURRENT_IP=$(ip -4 addr show eth0 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+    else
+      CURRENT_IP="Unknown"
+    fi
+    # IPv6 fallback
+    if [[ -z "$CURRENT_IP" ]]; then
+      CURRENT_IP=$(hostname -I 2>/dev/null | tr ' ' '\n' | grep ':' | head -n1)
+    fi
+  fi
+  echo "$CURRENT_IP"
+}
+
+# validate_container_id — идентична оригиналу, не зависит от dpkg
+validate_container_id() {
+  local ctid="$1"
+  [[ ! "$ctid" =~ ^[0-9]+$ ]] && return 1
+  [[ -f "/etc/pve/qemu-server/${ctid}.conf" || -f "/etc/pve/lxc/${ctid}.conf" ]] && return 1
+  lvs --noheadings -o lv_name 2>/dev/null | grep -qE "(^|[-_])${ctid}($|[-_])" && return 1
+  return 0
+}
+
+get_valid_container_id() {
+  local suggested_id="${1:-$(pvesh get /cluster/nextid)}"
+  while ! validate_container_id "$suggested_id"; do
+    suggested_id=$((suggested_id + 1))
+  done
+  echo "$suggested_id"
+}
+
+# Остальные validate_* и утилиты (validate_hostname, validate_mac_address,
+# validate_ip_address, ip_to_int, int_to_ip, resolve_ip_from_range,
+# find_host_ssh_keys, install_ssh_keys_into_ct, update_motd_ip) —
+# берём из оригинального build.func без изменений, т.к. они не используют
+# dpkg/apt-cache и работают одинаково на любом Linux.
+#
+# Чтобы не дублировать 600 строк кода, подгружаем их патчем поверх оригинала:
+
+_ORIG_BUILD_FUNC_CONTENT=$(curl -fsSL "$_ORIG_URL/misc/build.func" 2>/dev/null)
+
+# Извлекаем только функции из SECTION 3B и далее (начиная с ip_to_int),
+# которые не переопределены выше
+eval "$(echo "$_ORIG_BUILD_FUNC_CONTENT" | \
+  awk '/^# SECTION 3B/,0' | \
+  grep -v '^source ' | \
+  grep -v 'COMMUNITY_SCRIPTS_URL')"
+
+# =============================================================================
+# КОНЕЦ АДАПТИРОВАННОГО BUILD.FUNC
+# =============================================================================
