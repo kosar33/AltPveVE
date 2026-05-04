@@ -1,76 +1,96 @@
 #!/usr/bin/env bash
+# =============================================================================
+# LobeHub — CT-скрипт для Альт Виртуализация PVE
+# Источник: https://github.com/lobehub/lobehub
+# Адаптация: kosar33 / AltPveVE
+# Лицензия: MIT
+# =============================================================================
+#
+# Использование:
+#   bash -c "$(curl -fsSL https://raw.githubusercontent.com/kosar33/AltPveVE/main/ct/lobehub.sh)"
+#
+# Отличие от оригинала (community-scripts/ProxmoxVED):
+#   - Загружает misc/build.func из нашего форка (адаптирован под Альт, без dpkg)
+#   - install/lobehub-install.sh тоже берётся из нашего форка
+#   - Параметры контейнера не меняются
+# =============================================================================
 
-# 1. ПАТЧ ДЛЯ АЛЬТ ЛИНУКС (Исправляем ошибки в build.func без его переписывания)
-# Создаем эмуляцию dpkg, чтобы build.func не падал на проверках
-if ! command -v dpkg >/dev/null 2>&1; then
-  msg_info "Создаем эмуляцию dpkg для совместимости с Альт..."
-  function dpkg() {
-    if [[ "$*" == *"--print-architecture"* ]]; then echo "amd64"; return 0; fi
-    if [[ "$*" == *"--compare-versions"* ]]; then return 0; fi
-    return 0
-  }
-  export -f dpkg
-fi
+# Указываем наш форк — build.func подхватит это как COMMUNITY_SCRIPTS_URL
+# и будет брать install-скрипт оттуда же
+export ALT_SCRIPTS_URL="https://raw.githubusercontent.com/kosar33/AltPveVE/main"
 
-# Подменяем функцию проверки пакетов, так как в Альте нет deb-пакетов pve-container
-function dpkg-query() {
-  echo "9.9.9" # Имитируем очень новую версию
-}
-export -f dpkg-query
+# Загружаем наш адаптированный build.func
+source <(curl -fsSL "${ALT_SCRIPTS_URL}/misc/build.func")
 
-# Обманываем проверку apt-cache
-function apt-cache() {
-  echo "Candidate: 9.9.9"
-}
-export -f apt-cache
-
-# Пропускаем проверку стека LXC (в Альте он свой, но команды pct те же)
-function preflight_lxc_stack() {
-  return 0
-}
-export -f preflight_lxc_stack
-
-# 2. ЗАГРУЗКА ЯДРА
-source <(curl -fsSL https://raw.githubusercontent.com/community-scripts/ProxmoxVED/main/misc/build.func)
-
-# 3. НАСТРОЙКИ ПРИЛОЖЕНИЯ
+# --- Параметры приложения (идентичны оригиналу) ---
 APP="LobeHub"
-var_tags="ai;chat"
-var_cpu="6"
-var_ram="10240"
-var_disk="15"
-# ПРИНУДИТЕЛЬНО DEBIAN 12 (для работы на Альте)
-var_os="debian"
-var_version="12"
-var_unprivileged="1"
+var_tags="${var_tags:-ai;chat}"
+var_cpu="${var_cpu:-6}"
+var_ram="${var_ram:-10240}"
+var_disk="${var_disk:-15}"
+var_os="${var_os:-debian}"
+var_version="${var_version:-12}"
+var_unprivileged="${var_unprivileged:-1}"
 
 header_info "$APP"
+variables
+color
+catch_errors
 
-# 4. ПЕРЕОПРЕДЕЛЕНИЕ ФУНКЦИИ ОБНОВЛЕНИЯ
-# (Команды внутри контейнера остаются дебиановскими, т.к. сам контейнер - Debian 12)
+# --- Функция обновления (для уже установленного контейнера) ---
 function update_script() {
   header_info
+  check_container_storage
+  check_container_resources
+
   if [[ ! -d /opt/lobehub ]]; then
-    msg_error "LobeHub не найден!"
-    exit
+    msg_error "Установка ${APP} не найдена!"
+    exit 1
   fi
 
-  msg_info "Stopping LobeHub"
-  systemctl stop lobehub
-  
-  # Логика обновления Node.js приложения
-  cd /opt/lobehub
-  # ... (здесь команды pnpm install и build)
-  
-  systemctl start lobehub
-  msg_ok "Updated successfully!"
+  if check_for_gh_release "lobehub" "lobehub/lobehub"; then
+    msg_info "Останавливаем службу"
+    systemctl stop lobehub
+    msg_ok "Служба остановлена"
+
+    msg_info "Резервная копия конфигурации"
+    cp /opt/lobehub/.env /opt/lobehub.env.bak
+    msg_ok "Резервная копия создана"
+
+    CLEAN_INSTALL=1 fetch_and_deploy_gh_release "lobehub" "lobehub/lobehub" "tarball"
+
+    msg_info "Восстанавливаем конфигурацию"
+    cp /opt/lobehub.env.bak /opt/lobehub/.env
+    rm -f /opt/lobehub.env.bak
+    msg_ok "Конфигурация восстановлена"
+
+    msg_info "Сборка приложения"
+    cd /opt/lobehub
+    export NODE_OPTIONS="--max-old-space-size=8192"
+    $STD pnpm install
+    $STD pnpm run build:docker
+    unset NODE_OPTIONS
+    msg_ok "Приложение собрано"
+
+    msg_info "Миграция базы данных"
+    set -a && source /opt/lobehub/.env && set +a
+    $STD node /opt/lobehub/.next/standalone/docker.cjs
+    msg_ok "Миграция выполнена"
+
+    msg_info "Запускаем службу"
+    systemctl start lobehub
+    msg_ok "Служба запущена"
+    msg_ok "Обновление успешно завершено!"
+  fi
   exit
 }
 
-# 5. ЗАПУСК УСТАНОВКИ
+# --- Запуск ---
 start
 build_container
 description
 
-msg_ok "LobeHub развернут на Альт Виртуализации!"
-echo -e "${INFO}${YW} Адрес: ${BGN}http://${IP}:3210${CL}"
+msg_ok "Установка завершена!\n"
+echo -e "${CREATING}${GN}${APP} развёрнут на Альт Виртуализация PVE!${CL}"
+echo -e "${INFO}${YW} Адрес веб-интерфейса:${CL}"
+echo -e "${TAB}${GATEWAY}${BGN}http://${IP}:3210${CL}"
